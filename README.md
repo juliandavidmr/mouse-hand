@@ -1,21 +1,63 @@
-# Tauri + SvelteKit + TypeScript
+# Mouse Hand
 
-This template should help get you started developing with Tauri, SvelteKit and TypeScript in Vite.
+Mouse Hand is a compact macOS-style desktop app that lets you control the system pointer with your hand. It uses the webcam, TensorFlow hand pose detection, and native Tauri commands to move, click, and drag with simple gestures.
 
-## Recommended IDE Setup
+![Mouse Hand app screenshot](screenshot.png)
 
-[VS Code](https://code.visualstudio.com/) + [Svelte](https://marketplace.visualstudio.com/items?itemName=svelte.svelte-vscode) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer).
+## Features
 
-Make sure you have installed the prerequisites for your OS: https://tauri.app/start/prerequisites/, then run:
+- Real-time hand tracking with `@tensorflow-models/hand-pose-detection`.
+- Virtual hand keypoint diagram for debugging the detected hand pose.
+- Pointer movement with a closed fist and raised index finger.
+- Pinch-to-click with index finger and thumb.
+- Pinch-and-move drag and drop.
+- Adjustable mouse speed.
+- Native cursor actions through Tauri and Enigo.
+- Compact utility-style UI designed for a small desktop window.
+
+## Gestures
+
+| Gesture                            | Action             |
+| ---------------------------------- | ------------------ |
+| Closed fist + index finger raised  | Move the pointer   |
+| Index finger + thumb fully pinched | Mouse down / click |
+| Keep pinching and move             | Drag               |
+| Release pinch                      | Mouse up / drop    |
+
+## Requirements
+
+- Bun
+- Rust
+- Tauri desktop prerequisites for your OS
+- Webcam access
+- macOS Accessibility permission for native mouse control
+
+## Development
+
+Install dependencies:
+
+```bash
 bun install
-bun run tauri android init
-bun run tauri ios init
+```
 
-For Desktop development, run:
+Run the desktop app:
+
+```bash
 bun run tauri dev
+```
 
-For Android development, run:
-bun run tauri android dev
+Run frontend checks:
 
-For iOS development, run:
-bun run tauri ios dev
+```bash
+bun run check
+```
+
+Build the frontend:
+
+```bash
+bun run build
+```
+
+## Notes
+
+The webcam feed is processed locally in the app. The screenshot above intentionally blurs the camera preview to avoid exposing personal visual data.
