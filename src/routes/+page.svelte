@@ -1,572 +1,297 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
-  import { onDestroy, onMount } from "svelte";
-  import * as handPoseDetection from "@tensorflow-models/hand-pose-detection";
-  import "@tensorflow/tfjs-backend-webgl";
-  import * as tf from "@tensorflow/tfjs-core";
+	import { invoke } from "@tauri-apps/api/core";
+	import { onDestroy, onMount } from "svelte";
+	import * as handPoseDetection from "@tensorflow-models/hand-pose-detection";
+	import "@tensorflow/tfjs-backend-webgl";
+	import * as tf from "@tensorflow/tfjs-core";
+	import CameraStage from "$lib/features/hand-control/components/CameraStage.svelte";
+	import ControlSidebar from "$lib/features/hand-control/components/ControlSidebar.svelte";
+	import {
+		CAMERA_CONSTRAINTS,
+		CLICK_COOLDOWN_MS,
+		DEFAULT_POINTER_SPEED,
+		MEDIAPIPE_HANDS_SOLUTION_PATH,
+		MOVE_INTERVAL_MS,
+	} from "$lib/features/hand-control/constants";
+	import type { AppStatus, Point } from "$lib/features/hand-control/types";
+	import {
+		clearCanvas,
+		drawHands,
+	} from "$lib/features/hand-control/utils/drawing";
+	import { getGestureState } from "$lib/features/hand-control/utils/gestures";
+	import {
+		keypointToScreenPoint,
+		smoothPoint,
+	} from "$lib/features/hand-control/utils/pointer";
 
-  type Keypoint = handPoseDetection.Keypoint;
-  type Hand = handPoseDetection.Hand;
+	let video = $state<HTMLVideoElement | undefined>();
+	let canvas = $state<HTMLCanvasElement | undefined>();
+	let stream: MediaStream | null = null;
+	let detector = $state<handPoseDetection.HandDetector | null>(null);
+	let animationFrame = 0;
+	let isRunning = $state(false);
+	let pointerEnabled = $state(false);
+	let clickEnabled = $state(true);
+	let canPoint = $state(false);
+	let isPinching = $state(false);
+	let status = $state<AppStatus>("idle");
+	let statusMessage = $state("Initializing hand model...");
+	let handScore = $state(0);
+	let pointerSpeed = $state(DEFAULT_POINTER_SPEED);
+	let lastMoveAt = 0;
+	let lastClickAt = 0;
+	let smoothedPointer: Point | null = null;
 
-  const fingerJoints = {
-    index: [5, 6, 7, 8],
-    middle: [9, 10, 11, 12],
-    ring: [13, 14, 15, 16],
-    pinky: [17, 18, 19, 20]
-  } as const;
+	onMount(async () => {
+		await setupDetector();
+	});
 
-  let video: HTMLVideoElement;
-  let canvas: HTMLCanvasElement;
-  let stream: MediaStream | null = null;
-  let detector = $state<handPoseDetection.HandDetector | null>(null);
-  let animationFrame = 0;
-  let isRunning = $state(false);
-  let pointerEnabled = $state(false);
-  let isGestureActive = $state(false);
-  let status = $state("Inicializando modelo...");
-  let handScore = $state(0);
-  let lastMoveAt = 0;
-  let smoothedPointer: { x: number; y: number } | null = null;
+	onDestroy(() => {
+		stopCamera();
+		detector?.dispose();
+	});
 
-  const moveIntervalMs = 28;
-  const smoothing = 0.36;
+	async function setupDetector() {
+		try {
+			await tf.setBackend("webgl");
+			await tf.ready();
 
-  onMount(async () => {
-    await setupDetector();
-  });
+			detector = await handPoseDetection.createDetector(
+				handPoseDetection.SupportedModels.MediaPipeHands,
+				{
+					runtime: "mediapipe",
+					solutionPath: MEDIAPIPE_HANDS_SOLUTION_PATH,
+					modelType: "full",
+					maxHands: 1,
+				},
+			);
 
-  onDestroy(() => {
-    stopCamera();
-    detector?.dispose();
-  });
+			status = "ready";
+			statusMessage = "Model ready. Start the camera to begin.";
+		} catch (error) {
+			status = "error";
+			statusMessage = `Model failed: ${getErrorMessage(error)}`;
+		}
+	}
 
-  async function setupDetector() {
-    try {
-      await tf.setBackend("webgl");
-      await tf.ready();
+	async function startCamera() {
+		if (!detector) {
+			statusMessage = "The hand model is still loading.";
+			return;
+		}
 
-      detector = await handPoseDetection.createDetector(
-        handPoseDetection.SupportedModels.MediaPipeHands,
-        {
-          runtime: "mediapipe",
-          solutionPath: "https://cdn.jsdelivr.net/npm/@mediapipe/hands",
-          modelType: "full",
-          maxHands: 1
-        }
-      );
+		try {
+			stream = await navigator.mediaDevices.getUserMedia(CAMERA_CONSTRAINTS);
+			if (!video) return;
 
-      status = "Modelo listo. Activa la camara para empezar.";
-    } catch (error) {
-      status = `No se pudo cargar el modelo: ${getErrorMessage(error)}`;
-    }
-  }
+			video.srcObject = stream;
+			await video.play();
 
-  async function startCamera() {
-    if (!detector) {
-      status = "El modelo aun no esta listo.";
-      return;
-    }
+			isRunning = true;
+			status = "searching";
+			statusMessage = "Looking for a hand...";
+			detectFrame();
+		} catch (error) {
+			status = "error";
+			statusMessage = `Camera failed: ${getErrorMessage(error)}`;
+		}
+	}
 
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          width: { ideal: 960 },
-          height: { ideal: 720 },
-          facingMode: "user"
-        },
-        audio: false
-      });
+	function stopCamera() {
+		isRunning = false;
+		canPoint = false;
+		isPinching = false;
+		handScore = 0;
+		smoothedPointer = null;
+		cancelAnimationFrame(animationFrame);
+		stream?.getTracks().forEach((track) => track.stop());
+		stream = null;
+		if (video) {
+			video.srcObject = null;
+		}
+		clearCanvas(canvas);
+		if (detector) {
+			status = "ready";
+			statusMessage = "Model ready. Start the camera to begin.";
+		}
+	}
 
-      video.srcObject = stream;
-      await video.play();
+	async function detectFrame() {
+		if (
+			!detector ||
+			!video ||
+			!canvas ||
+			video.readyState < HTMLMediaElement.HAVE_ENOUGH_DATA
+		) {
+			animationFrame = requestAnimationFrame(detectFrame);
+			return;
+		}
 
-      isRunning = true;
-      status = "Buscando mano...";
-      detectFrame();
-    } catch (error) {
-      status = `No se pudo abrir la camara: ${getErrorMessage(error)}`;
-    }
-  }
+		const hands = await detector.estimateHands(video, { flipHorizontal: true });
+		const hand = hands[0];
+		drawHands(canvas, video, hands);
 
-  function stopCamera() {
-    isRunning = false;
-    isGestureActive = false;
-    handScore = 0;
-    smoothedPointer = null;
-    cancelAnimationFrame(animationFrame);
-    stream?.getTracks().forEach((track) => track.stop());
-    stream = null;
-    if (video) {
-      video.srcObject = null;
-    }
-    clearCanvas();
-  }
+		if (!hand) {
+			canPoint = false;
+			isPinching = false;
+			handScore = 0;
+			smoothedPointer = null;
+			status = "searching";
+			statusMessage = "No hand detected.";
+			animationFrame = requestAnimationFrame(detectFrame);
+			return;
+		}
 
-  async function detectFrame() {
-    if (!detector || !video || video.readyState < HTMLMediaElement.HAVE_ENOUGH_DATA) {
-      animationFrame = requestAnimationFrame(detectFrame);
-      return;
-    }
+		handScore = hand.score ?? 0;
+		const gesture = getGestureState(hand.keypoints, isPinching);
+		canPoint = gesture.canPoint;
+		isPinching = gesture.isPinching;
 
-    const hands = await detector.estimateHands(video, { flipHorizontal: true });
-    const hand = hands[0];
-    drawHands(hands);
+		if (canPoint && pointerEnabled) {
+			await movePointer(hand.keypoints[8]);
+		} else {
+			smoothedPointer = null;
+		}
 
-    if (!hand) {
-      isGestureActive = false;
-      handScore = 0;
-      smoothedPointer = null;
-      status = "No hay mano detectada.";
-    } else {
-      handScore = hand.score ?? 0;
-      const gestureActive = isPointerGesture(hand.keypoints);
-      isGestureActive = gestureActive;
-      status = gestureActive
-        ? pointerEnabled
-          ? "Gesto activo: moviendo cursor."
-          : "Gesto activo. Activa control para mover el cursor."
-        : "Cierra el puno y deja solo el indice levantado.";
+		if (isPinching && clickEnabled && pointerEnabled) {
+			await clickPointer();
+		}
 
-      if (gestureActive && pointerEnabled) {
-        await movePointer(hand.keypoints[8]);
-      } else {
-        smoothedPointer = null;
-      }
-    }
+		updateStatus();
+		animationFrame = requestAnimationFrame(detectFrame);
+	}
 
-    animationFrame = requestAnimationFrame(detectFrame);
-  }
+	async function movePointer(indexTip: handPoseDetection.Keypoint) {
+		if (!video) return;
 
-  function isPointerGesture(keypoints: Keypoint[]) {
-    const indexExtended = isFingerExtended(keypoints, fingerJoints.index);
-    const middleClosed = isFingerClosed(keypoints, fingerJoints.middle);
-    const ringClosed = isFingerClosed(keypoints, fingerJoints.ring);
-    const pinkyClosed = isFingerClosed(keypoints, fingerJoints.pinky);
+		const now = performance.now();
+		if (now - lastMoveAt < MOVE_INTERVAL_MS) return;
+		lastMoveAt = now;
 
-    return indexExtended && middleClosed && ringClosed && pinkyClosed;
-  }
+		const target = keypointToScreenPoint(indexTip, video);
+		smoothedPointer = smoothPoint(smoothedPointer, target, pointerSpeed);
 
-  function isFingerExtended(keypoints: Keypoint[], joints: readonly [number, number, number, number]) {
-    const [mcpIndex, pipIndex, dipIndex, tipIndex] = joints;
-    const wrist = keypoints[0];
-    const mcp = keypoints[mcpIndex];
-    const pip = keypoints[pipIndex];
-    const dip = keypoints[dipIndex];
-    const tip = keypoints[tipIndex];
+		await invoke("move_cursor", {
+			x: Math.round(smoothedPointer.x),
+			y: Math.round(smoothedPointer.y),
+		});
+	}
 
-    return (
-      distance(tip, wrist) > distance(pip, wrist) * 1.16 &&
-      distance(tip, mcp) > distance(dip, mcp) * 1.08 &&
-      distance(tip, pip) > distance(dip, pip) * 1.05
-    );
-  }
+	async function clickPointer() {
+		const now = performance.now();
+		if (now - lastClickAt < CLICK_COOLDOWN_MS) return;
+		lastClickAt = now;
+		await invoke("click_mouse");
+	}
 
-  function isFingerClosed(keypoints: Keypoint[], joints: readonly [number, number, number, number]) {
-    const [mcpIndex, pipIndex, dipIndex, tipIndex] = joints;
-    const wrist = keypoints[0];
-    const mcp = keypoints[mcpIndex];
-    const pip = keypoints[pipIndex];
-    const dip = keypoints[dipIndex];
-    const tip = keypoints[tipIndex];
+	function updateStatus() {
+		if (isPinching && clickEnabled && pointerEnabled) {
+			status = "gesture";
+			statusMessage = "Pinch detected. Click sent.";
+			return;
+		}
 
-    return (
-      distance(tip, wrist) < distance(pip, wrist) * 1.08 ||
-      distance(tip, mcp) < distance(dip, mcp) * 1.18 ||
-      distance(tip, pip) < distance(dip, pip) * 1.2
-    );
-  }
+		if (canPoint && pointerEnabled) {
+			status = "tracking";
+			statusMessage = "Pointer active. Move your raised index finger.";
+			return;
+		}
 
-  function distance(a: Keypoint, b: Keypoint) {
-    return Math.hypot(a.x - b.x, a.y - b.y);
-  }
+		if (canPoint) {
+			status = "gesture";
+			statusMessage =
+				"Pointer gesture detected. Enable Pointer to control the cursor.";
+			return;
+		}
 
-  async function movePointer(indexTip: Keypoint) {
-    const now = performance.now();
-    if (now - lastMoveAt < moveIntervalMs) return;
-    lastMoveAt = now;
+		status = "searching";
+		statusMessage = "Close your fist and raise only the index finger.";
+	}
 
-    const videoWidth = video.videoWidth || video.clientWidth;
-    const videoHeight = video.videoHeight || video.clientHeight;
-    const target = {
-      x: clamp(indexTip.x / videoWidth, 0, 1) * window.screen.availWidth,
-      y: clamp(indexTip.y / videoHeight, 0, 1) * window.screen.availHeight
-    };
-
-    smoothedPointer = smoothedPointer
-      ? {
-          x: smoothedPointer.x + (target.x - smoothedPointer.x) * smoothing,
-          y: smoothedPointer.y + (target.y - smoothedPointer.y) * smoothing
-        }
-      : target;
-
-    await invoke("move_cursor", {
-      x: Math.round(smoothedPointer.x),
-      y: Math.round(smoothedPointer.y)
-    });
-  }
-
-  function drawHands(hands: Hand[]) {
-    if (!canvas || !video) return;
-
-    const context = canvas.getContext("2d");
-    if (!context) return;
-
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    context.clearRect(0, 0, canvas.width, canvas.height);
-
-    for (const hand of hands) {
-      drawConnections(context, hand.keypoints);
-      for (const keypoint of hand.keypoints) {
-        context.beginPath();
-        context.arc(keypoint.x, keypoint.y, keypoint.name === "index_finger_tip" ? 7 : 4, 0, Math.PI * 2);
-        context.fillStyle = keypoint.name === "index_finger_tip" ? "#ffca3a" : "#6be675";
-        context.fill();
-      }
-    }
-  }
-
-  function drawConnections(context: CanvasRenderingContext2D, keypoints: Keypoint[]) {
-    const connections = [
-      [0, 1], [1, 2], [2, 3], [3, 4],
-      [0, 5], [5, 6], [6, 7], [7, 8],
-      [0, 9], [9, 10], [10, 11], [11, 12],
-      [0, 13], [13, 14], [14, 15], [15, 16],
-      [0, 17], [17, 18], [18, 19], [19, 20],
-      [5, 9], [9, 13], [13, 17]
-    ];
-
-    context.lineWidth = 3;
-    context.strokeStyle = "rgba(255, 255, 255, 0.74)";
-    for (const [start, end] of connections) {
-      context.beginPath();
-      context.moveTo(keypoints[start].x, keypoints[start].y);
-      context.lineTo(keypoints[end].x, keypoints[end].y);
-      context.stroke();
-    }
-  }
-
-  function clearCanvas() {
-    const context = canvas?.getContext("2d");
-    context?.clearRect(0, 0, canvas.width, canvas.height);
-  }
-
-  function clamp(value: number, min: number, max: number) {
-    return Math.min(Math.max(value, min), max);
-  }
-
-  function getErrorMessage(error: unknown) {
-    return error instanceof Error ? error.message : String(error);
-  }
+	function getErrorMessage(error: unknown) {
+		return error instanceof Error ? error.message : String(error);
+	}
 </script>
 
 <svelte:head>
-  <title>Mouse Hand</title>
+	<title>Mouse Hand</title>
 </svelte:head>
 
 <main class="app-shell">
-  <section class="workspace">
-    <div class="camera-frame" class:active={isGestureActive}>
-      <video bind:this={video} playsinline muted></video>
-      <canvas bind:this={canvas}></canvas>
-      <div class="empty-state" class:hidden={isRunning}>
-        <h1>Mouse Hand</h1>
-        <p>Control del cursor con MediaPipe Hands y el dedo indice.</p>
-      </div>
-    </div>
+	<section class="window">
+		<CameraStage
+			bind:videoElement={video}
+			bind:canvasElement={canvas}
+			{isRunning}
+			{canPoint}
+			{isPinching}
+			{status}
+		/>
 
-    <aside class="control-panel">
-      <div>
-        <p class="eyebrow">Hand pose detection</p>
-        <h2>Cursor con indice</h2>
-      </div>
-
-      <div class="status-card" class:ready={isGestureActive}>
-        <span class="status-dot"></span>
-        <p>{status}</p>
-      </div>
-
-      <div class="metrics">
-        <div>
-          <span>Confianza</span>
-          <strong>{Math.round(handScore * 100)}%</strong>
-        </div>
-        <div>
-          <span>Gesto</span>
-          <strong>{isGestureActive ? "Activo" : "Inactivo"}</strong>
-        </div>
-      </div>
-
-      <label class="toggle">
-        <input type="checkbox" bind:checked={pointerEnabled} />
-        <span></span>
-        Controlar cursor
-      </label>
-
-      <div class="actions">
-        {#if isRunning}
-          <button type="button" onclick={stopCamera}>Detener camara</button>
-        {:else}
-          <button type="button" onclick={startCamera} disabled={!detector}>Activar camara</button>
-        {/if}
-      </div>
-    </aside>
-  </section>
+		<ControlSidebar
+			{status}
+			{statusMessage}
+			{handScore}
+			{canPoint}
+			{isPinching}
+			bind:pointerEnabled
+			bind:clickEnabled
+			bind:pointerSpeed
+			detectorReady={Boolean(detector)}
+			{isRunning}
+			onStart={startCamera}
+			onStop={stopCamera}
+		/>
+	</section>
 </main>
 
 <style>
-  :global(*) {
-    box-sizing: border-box;
-  }
+	:global(*) {
+		box-sizing: border-box;
+	}
 
-  :global(body) {
-    margin: 0;
-    min-width: 320px;
-    min-height: 100vh;
-    font-family:
-      Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    color: #eaf0f1;
-    background: #101313;
-  }
+	:global(body) {
+		margin: 0;
+		min-width: 320px;
+		min-height: 100vh;
+		overflow: hidden;
+		font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+			"SF Pro Display", "Segoe UI", sans-serif;
+		color: #1d1d1f;
+		background: linear-gradient(135deg, #e9edf5 0%, #f8f8fb 48%, #e9f4ef 100%);
+		font-synthesis: none;
+		text-rendering: optimizeLegibility;
+		-webkit-font-smoothing: antialiased;
+		-moz-osx-font-smoothing: grayscale;
+	}
 
-  .app-shell {
-    min-height: 100vh;
-    padding: 24px;
-    background:
-      linear-gradient(135deg, rgba(31, 87, 91, 0.18), transparent 42%),
-      linear-gradient(315deg, rgba(116, 67, 40, 0.2), transparent 40%),
-      #101313;
-  }
+	.app-shell {
+		min-height: 100vh;
+		padding: 22px;
+	}
 
-  .workspace {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) 320px;
-    gap: 20px;
-    width: min(1180px, 100%);
-    min-height: calc(100vh - 48px);
-    margin: 0 auto;
-    align-items: stretch;
-  }
+	.window {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) 326px;
+		gap: 16px;
+		width: min(1220px, 100%);
+		min-height: calc(100vh - 44px);
+		margin: 0 auto;
+		align-items: stretch;
+	}
 
-  .camera-frame {
-    position: relative;
-    min-height: 520px;
-    overflow: hidden;
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 8px;
-    background: #171b1b;
-  }
+	@media (max-width: 860px) {
+		:global(body) {
+			overflow: auto;
+		}
 
-  .camera-frame.active {
-    border-color: rgba(107, 230, 117, 0.82);
-    box-shadow: 0 0 0 1px rgba(107, 230, 117, 0.2);
-  }
+		.app-shell {
+			padding: 12px;
+		}
 
-  video,
-  canvas {
-    position: absolute;
-    inset: 0;
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-  }
-
-  video {
-    transform: scaleX(-1);
-  }
-
-  .empty-state {
-    position: absolute;
-    inset: 0;
-    display: grid;
-    place-content: center;
-    gap: 10px;
-    padding: 28px;
-    text-align: center;
-    background:
-      linear-gradient(135deg, rgba(31, 87, 91, 0.35), transparent),
-      #171b1b;
-  }
-
-  .empty-state.hidden {
-    display: none;
-  }
-
-  h1,
-  h2,
-  p {
-    margin: 0;
-  }
-
-  h1 {
-    font-size: 48px;
-    line-height: 1;
-  }
-
-  h2 {
-    font-size: 28px;
-    line-height: 1.1;
-  }
-
-  .control-panel {
-    display: flex;
-    flex-direction: column;
-    gap: 18px;
-    padding: 22px;
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 8px;
-    background: rgba(18, 22, 22, 0.92);
-  }
-
-  .eyebrow {
-    margin-bottom: 8px;
-    color: #9ccbcc;
-    font-size: 12px;
-    font-weight: 700;
-    letter-spacing: 0;
-    text-transform: uppercase;
-  }
-
-  .status-card,
-  .metrics,
-  .toggle {
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 8px;
-    background: rgba(255, 255, 255, 0.045);
-  }
-
-  .status-card {
-    display: grid;
-    grid-template-columns: 12px 1fr;
-    gap: 12px;
-    align-items: start;
-    padding: 14px;
-    color: #c6d2d3;
-  }
-
-  .status-card.ready {
-    color: #effff0;
-    background: rgba(107, 230, 117, 0.11);
-  }
-
-  .status-dot {
-    width: 12px;
-    height: 12px;
-    margin-top: 6px;
-    border-radius: 50%;
-    background: #7c898a;
-  }
-
-  .status-card.ready .status-dot {
-    background: #6be675;
-  }
-
-  .metrics {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    overflow: hidden;
-  }
-
-  .metrics div {
-    display: flex;
-    min-height: 74px;
-    flex-direction: column;
-    justify-content: center;
-    gap: 6px;
-    padding: 14px;
-  }
-
-  .metrics div + div {
-    border-left: 1px solid rgba(255, 255, 255, 0.1);
-  }
-
-  .metrics span {
-    color: #9aa7a8;
-    font-size: 13px;
-  }
-
-  .metrics strong {
-    font-size: 22px;
-  }
-
-  .toggle {
-    display: grid;
-    grid-template-columns: 46px 1fr;
-    gap: 12px;
-    align-items: center;
-    padding: 13px 14px;
-    color: #dde7e7;
-    font-weight: 700;
-    cursor: pointer;
-  }
-
-  .toggle input {
-    position: absolute;
-    opacity: 0;
-  }
-
-  .toggle span {
-    position: relative;
-    width: 46px;
-    height: 26px;
-    border-radius: 999px;
-    background: #3b4445;
-  }
-
-  .toggle span::after {
-    content: "";
-    position: absolute;
-    top: 3px;
-    left: 3px;
-    width: 20px;
-    height: 20px;
-    border-radius: 50%;
-    background: #eaf0f1;
-    transition: transform 160ms ease;
-  }
-
-  .toggle input:checked + span {
-    background: #2c8f57;
-  }
-
-  .toggle input:checked + span::after {
-    transform: translateX(20px);
-  }
-
-  .actions {
-    margin-top: auto;
-  }
-
-  button {
-    width: 100%;
-    min-height: 46px;
-    border: 0;
-    border-radius: 8px;
-    color: #101313;
-    background: #ffca3a;
-    font: inherit;
-    font-weight: 800;
-    cursor: pointer;
-  }
-
-  button:disabled {
-    color: #93a0a1;
-    background: #313a3b;
-    cursor: wait;
-  }
-
-  @media (max-width: 860px) {
-    .app-shell {
-      padding: 14px;
-    }
-
-    .workspace {
-      grid-template-columns: 1fr;
-      min-height: auto;
-    }
-
-    .camera-frame {
-      min-height: 52vh;
-    }
-  }
+		.window {
+			grid-template-columns: 1fr;
+			min-height: auto;
+		}
+	}
 </style>
