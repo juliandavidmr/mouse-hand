@@ -6,9 +6,11 @@
 	import * as tf from "@tensorflow/tfjs-core";
 	import CameraStage from "$lib/features/hand-control/components/CameraStage.svelte";
 	import ControlSidebar from "$lib/features/hand-control/components/ControlSidebar.svelte";
+	import KeypointDiagram from "$lib/features/hand-control/components/KeypointDiagram.svelte";
 	import {
 		CAMERA_CONSTRAINTS,
 		CLICK_COOLDOWN_MS,
+		DRAG_START_DISTANCE_PX,
 		DEFAULT_POINTER_SPEED,
 		MEDIAPIPE_HANDS_SOLUTION_PATH,
 		MOVE_INTERVAL_MS,
@@ -34,12 +36,16 @@
 	let clickEnabled = $state(true);
 	let canPoint = $state(false);
 	let isPinching = $state(false);
+	let isDragging = $state(false);
 	let status = $state<AppStatus>("idle");
 	let statusMessage = $state("Initializing hand model...");
 	let handScore = $state(0);
 	let pointerSpeed = $state(DEFAULT_POINTER_SPEED);
+	let currentKeypoints = $state<handPoseDetection.Keypoint[] | null>(null);
 	let lastMoveAt = 0;
 	let lastClickAt = 0;
+	let mouseButtonIsDown = false;
+	let pinchStartPoint: Point | null = null;
 	let smoothedPointer: Point | null = null;
 
 	onMount(async () => {
@@ -101,8 +107,11 @@
 		isRunning = false;
 		canPoint = false;
 		isPinching = false;
+		isDragging = false;
 		handScore = 0;
+		currentKeypoints = null;
 		smoothedPointer = null;
+		releaseMouseButton();
 		cancelAnimationFrame(animationFrame);
 		stream?.getTracks().forEach((track) => track.stop());
 		stream = null;
@@ -134,8 +143,11 @@
 		if (!hand) {
 			canPoint = false;
 			isPinching = false;
+			isDragging = false;
 			handScore = 0;
+			currentKeypoints = null;
 			smoothedPointer = null;
+			await releaseMouseButton();
 			status = "searching";
 			statusMessage = "No hand detected.";
 			animationFrame = requestAnimationFrame(detectFrame);
@@ -143,18 +155,25 @@
 		}
 
 		handScore = hand.score ?? 0;
+		currentKeypoints = hand.keypoints;
 		const gesture = getGestureState(hand.keypoints, isPinching);
 		canPoint = gesture.canPoint;
 		isPinching = gesture.isPinching;
 
-		if (canPoint && pointerEnabled) {
-			await movePointer(hand.keypoints[8]);
-		} else {
+		const shouldMovePointer = pointerEnabled && (canPoint || isPinching);
+		const pointerPoint = shouldMovePointer
+			? await movePointer(hand.keypoints[8])
+			: null;
+
+		if (!shouldMovePointer) {
 			smoothedPointer = null;
+			await releaseMouseButton();
 		}
 
-		if (isPinching && clickEnabled && pointerEnabled) {
-			await clickPointer();
+		if (clickEnabled && pointerEnabled) {
+			await handlePinch(pointerPoint);
+		} else {
+			await releaseMouseButton();
 		}
 
 		updateStatus();
@@ -162,10 +181,10 @@
 	}
 
 	async function movePointer(indexTip: handPoseDetection.Keypoint) {
-		if (!video) return;
+		if (!video) return null;
 
 		const now = performance.now();
-		if (now - lastMoveAt < MOVE_INTERVAL_MS) return;
+		if (now - lastMoveAt < MOVE_INTERVAL_MS) return smoothedPointer;
 		lastMoveAt = now;
 
 		const target = keypointToScreenPoint(indexTip, video);
@@ -175,19 +194,55 @@
 			x: Math.round(smoothedPointer.x),
 			y: Math.round(smoothedPointer.y),
 		});
+
+		return smoothedPointer;
 	}
 
-	async function clickPointer() {
+	async function handlePinch(pointerPoint: Point | null) {
+		if (!isPinching) {
+			await releaseMouseButton();
+			return;
+		}
+
 		const now = performance.now();
 		if (now - lastClickAt < CLICK_COOLDOWN_MS) return;
-		lastClickAt = now;
-		await invoke("click_mouse");
+
+		if (!mouseButtonIsDown) {
+			mouseButtonIsDown = true;
+			isDragging = false;
+			pinchStartPoint = pointerPoint;
+			await invoke("mouse_down");
+			return;
+		}
+
+		if (pointerPoint && pinchStartPoint) {
+			const moved = Math.hypot(
+				pointerPoint.x - pinchStartPoint.x,
+				pointerPoint.y - pinchStartPoint.y,
+			);
+			isDragging = moved >= DRAG_START_DISTANCE_PX;
+		}
+	}
+
+	async function releaseMouseButton() {
+		if (!mouseButtonIsDown) return;
+
+		mouseButtonIsDown = false;
+		pinchStartPoint = null;
+		lastClickAt = performance.now();
+		await invoke("mouse_up");
 	}
 
 	function updateStatus() {
+		if (isDragging && clickEnabled && pointerEnabled) {
+			status = "gesture";
+			statusMessage = "Drag active. Release the pinch to drop.";
+			return;
+		}
+
 		if (isPinching && clickEnabled && pointerEnabled) {
 			status = "gesture";
-			statusMessage = "Pinch detected. Click sent.";
+			statusMessage = "Pinch held. Move to drag or release to click.";
 			return;
 		}
 
@@ -219,29 +274,38 @@
 
 <main class="app-shell">
 	<section class="window">
-		<CameraStage
-			bind:videoElement={video}
-			bind:canvasElement={canvas}
-			{isRunning}
-			{canPoint}
+		<KeypointDiagram
+			keypoints={currentKeypoints}
 			{isPinching}
-			{status}
+			{isDragging}
+			{canPoint}
 		/>
 
-		<ControlSidebar
-			{status}
-			{statusMessage}
-			{handScore}
-			{canPoint}
-			{isPinching}
-			bind:pointerEnabled
-			bind:clickEnabled
-			bind:pointerSpeed
-			detectorReady={Boolean(detector)}
-			{isRunning}
-			onStart={startCamera}
-			onStop={stopCamera}
-		/>
+		<div class="utility-column">
+			<ControlSidebar
+				{status}
+				{statusMessage}
+				{handScore}
+				{canPoint}
+				{isPinching}
+				bind:pointerEnabled
+				bind:clickEnabled
+				bind:pointerSpeed
+				detectorReady={Boolean(detector)}
+				{isRunning}
+				onStart={startCamera}
+				onStop={stopCamera}
+			/>
+
+			<CameraStage
+				bind:videoElement={video}
+				bind:canvasElement={canvas}
+				{isRunning}
+				{canPoint}
+				{isPinching}
+				{status}
+			/>
+		</div>
 	</section>
 </main>
 
@@ -255,6 +319,8 @@
 		min-width: 320px;
 		min-height: 100vh;
 		overflow: hidden;
+		display: grid;
+		place-items: center;
 		font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
 			"SF Pro Display", "Segoe UI", sans-serif;
 		color: #1d1d1f;
@@ -266,18 +332,32 @@
 	}
 
 	.app-shell {
-		min-height: 100vh;
-		padding: 22px;
+		width: 100%;
+		height: 100vh;
+		padding: 6px;
+		overflow: hidden;
 	}
 
 	.window {
 		display: grid;
-		grid-template-columns: minmax(0, 1fr) 326px;
-		gap: 16px;
-		width: min(1220px, 100%);
-		min-height: calc(100vh - 44px);
-		margin: 0 auto;
+		grid-template-columns: minmax(0, 1fr) 236px;
+		gap: 6px;
+		width: calc(100vw - 12px);
+		height: calc(100vh - 12px);
+		margin: 0;
 		align-items: stretch;
+		min-height: 0;
+		min-width: 0;
+		overflow: hidden;
+	}
+
+	.utility-column {
+		display: grid;
+		grid-template-rows: minmax(0, 1fr) 122px;
+		gap: 6px;
+		min-height: 0;
+		min-width: 0;
+		overflow: hidden;
 	}
 
 	@media (max-width: 860px) {
@@ -286,12 +366,19 @@
 		}
 
 		.app-shell {
-			padding: 12px;
+			height: auto;
+			padding: 6px;
 		}
 
 		.window {
 			grid-template-columns: 1fr;
+			width: calc(100vw - 12px);
+			height: auto;
 			min-height: auto;
+		}
+
+		.utility-column {
+			grid-template-rows: auto 122px;
 		}
 	}
 </style>

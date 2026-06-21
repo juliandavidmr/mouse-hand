@@ -20,10 +20,10 @@
 <style>
 	.toggle-row {
 		display: grid;
-		grid-template-columns: 1fr 44px;
-		gap: 12px;
+		grid-template-columns: 1fr 28px;
+		gap: 5px;
 		align-items: center;
-		padding: 11px 0;
+		padding: 5px 0;
 		cursor: pointer;
 	}
 
@@ -36,13 +36,14 @@
 
 	strong {
 		color: #1d1d1f;
-		font-size: 13px;
+		font-size: 10px;
 		line-height: 1.2;
 	}
 
 	small {
+		display: none;
 		color: #6e6e73;
-		font-size: 12px;
+		font-size: 10px;
 		line-height: 1.25;
 	}
 
@@ -53,8 +54,8 @@
 
 	.switch {
 		position: relative;
-		width: 44px;
-		height: 26px;
+		width: 28px;
+		height: 16px;
 		border-radius: 999px;
 		background: #d1d1d6;
 		transition: background 140ms ease;
@@ -65,8 +66,8 @@
 		position: absolute;
 		top: 2px;
 		left: 2px;
-		width: 22px;
-		height: 22px;
+		width: 12px;
+		height: 12px;
 		border-radius: 50%;
 		background: white;
 		box-shadow: 0 2px 5px rgba(0, 0, 0, 0.22);
@@ -78,6 +79,6 @@
 	}
 
 	input:checked + .switch::after {
-		transform: translateX(18px);
+		transform: translateX(12px);
 	}
 </style>

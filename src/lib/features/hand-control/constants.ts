@@ -27,6 +27,7 @@ export const HAND_CONNECTIONS = [
 
 export const MOVE_INTERVAL_MS = 20;
 export const CLICK_COOLDOWN_MS = 420;
+export const DRAG_START_DISTANCE_PX = 14;
 export const DEFAULT_POINTER_SPEED = 0.46;
-export const PINCH_RATIO = 0.33;
-export const PINCH_RELEASE_RATIO = 0.48;
+export const PINCH_RATIO = 0.18;
+export const PINCH_RELEASE_RATIO = 0.28;

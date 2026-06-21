@@ -31,6 +31,30 @@ fn click_mouse(controller: tauri::State<'_, MouseController>) -> Result<(), Stri
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+fn mouse_down(controller: tauri::State<'_, MouseController>) -> Result<(), String> {
+    let mut enigo = controller
+        .0
+        .lock()
+        .map_err(|_| "No se pudo bloquear el controlador del mouse".to_string())?;
+
+    enigo
+        .button(Button::Left, Direction::Press)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn mouse_up(controller: tauri::State<'_, MouseController>) -> Result<(), String> {
+    let mut enigo = controller
+        .0
+        .lock()
+        .map_err(|_| "No se pudo bloquear el controlador del mouse".to_string())?;
+
+    enigo
+        .button(Button::Left, Direction::Release)
+        .map_err(|error| error.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let enigo = Enigo::new(&Settings::default()).expect("error initializing mouse controller");
@@ -38,7 +62,12 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(MouseController(Mutex::new(enigo)))
-        .invoke_handler(tauri::generate_handler![move_cursor, click_mouse])
+        .invoke_handler(tauri::generate_handler![
+            move_cursor,
+            click_mouse,
+            mouse_down,
+            mouse_up
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
